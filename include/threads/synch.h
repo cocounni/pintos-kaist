@@ -37,7 +37,13 @@ void cond_init (struct condition *);
 void cond_wait (struct condition *, struct lock *);
 void cond_signal (struct condition *, struct lock *);
 void cond_broadcast (struct condition *, struct lock *);
+//add function
+bool sema_compare_priority(const struct list_elem *a, const struct list_elem *b, void *aux);
+bool donate_compare_priority(const struct list_elem *a, const struct list_elem *b, void *aux);
 
+void donate_priority();
+void remove_lock_donation_list(struct lock *lock);
+void refresh_priority (void);
 /* Optimization barrier.
  *
  * The compiler will not reorder operations across an

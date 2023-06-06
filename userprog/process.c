@@ -50,6 +50,10 @@ process_create_initd (const char *file_name) {
 		return TID_ERROR;
 	strlcpy (fn_copy, file_name, PGSIZE);
 
+	// project2 추가부분 - Argument Parsing
+	char *save_ptr;
+	strtok_r(file_name, " ", &save_ptr);
+
 	/* Create a new thread to execute FILE_NAME. */
 	tid = thread_create (file_name, PRI_DEFAULT, initd, fn_copy);
 	if (tid == TID_ERROR)
@@ -174,19 +178,91 @@ process_exec (void *f_name) {
 	_if.eflags = FLAG_IF | FLAG_MBS;
 
 	/* We first kill the current context */
-	process_cleanup ();
+	process_cleanup ();		// 현재 프로세스가 사용하고 있던 pml4를 모두 반환
+
+	/* project2 추가 - argument를 parsing한다. */
+	char *argv[128];		// 인자들 넣을 준비
+	int argc = 0;
+
+	char *token, *save_ptr;
+	for (token = strtok_r(file_name, " ", &save_ptr); token != NULL;
+		token = strtok_r(NULL, " ", &save_ptr)){
+			argv[argc] = token;
+			argc++;
+	}
+	// argv = {"args-single", "onearg", NULL}가 된다.
 
 	/* And then load the binary */
-	success = load (file_name, &_if);
-
+	success = load (file_name, &_if);		// 새로운 프로세스를 메모리에 적재함
+	
 	/* If load failed, quit. */
+	// project2 수정부분
+	// palloc_free_page (file_name);
+	if (!success)
+	{
+		palloc_free_page (file_name);
+		return -1;
+	}
+
+	/* command line에서 받은 인자들을 스택에 차곡차곡 쌓는다. */
+	argument_stack(argv, argc, &_if);
+	_if.R.rdi = argc;			// 첫 번째 인자 argc를 RDI에.
+	_if.R.rsi = _if.rsp + 8;	
+	// 두 번째 인자 argv를 RSI에. 
+	// 그냥 argv를 넣으면 여기 커널 스택에서의 char *argv[128]의 주소가 나온다.
+	// 따라서 유저 스택에 쌓은 argv의 주소를 가져와야 하므로 _if.rsp+8이다.
+
+	hex_dump(_if.rsp, _if.rsp, USER_STACK - _if.rsp, true);		// 메모리 쌓이는 거 확인
+
+
+	/* 작업이 끝났으므로 동적할당한 file_name이 담긴 메모리 free */
 	palloc_free_page (file_name);
+
 	if (!success)
 		return -1;
 
 	/* Start switched process. */
+	/* 지금까지 바꿔준 인터럽트 프레임의 값으로 레지스터 값을 바꿔준다.
+		즉, 새 프로세스로 switching한다.  */
 	do_iret (&_if);
 	NOT_REACHED ();
+}
+
+/* project2 추가 부분. argument_stack 구현 */
+void
+argument_stack(char **argv, int argc, struct intr_frame *_if){
+	char *arg_address[128];
+
+	// 1. Save arguments strings (character by character)
+	// 맨 처음 if_->rsp = 0x47480000(USER_STACK)
+	for (int i = argc - 1; i >= 0; i--)		// 가장 idx가 큰 argv부터 쌓는다.
+	{
+		int argv_len = strlen(argv[i]);		// argv[1] = "onearg", argv_len = 6
+		_if->rsp -= (argv_len + 1);
+		memcpy(_if->rsp, argv[i], argv_len + 1);
+		arg_address[i] = _if->rsp;
+	}
+
+	// 2. Word-align padding
+	while(_if->rsp % 8 != 0){
+		_if->rsp--;
+		*(uint8_t *)(_if->rsp) = 0;
+	}
+
+	// 3. Pointers to the argument strings
+	size_t PTR_SIZE = sizeof(char *);	// PTR_SIZE == 8
+	for (int i = argc; i >= 0; i--)
+	{
+		_if->rsp = _if->rsp - PTR_SIZE;
+		if (i == argc)		// 맨 위에는 padding?
+			memset(_if->rsp, 0, PTR_SIZE);
+		else
+			memcpy(_if->rsp, &arg_address[i], PTR_SIZE);
+	}
+
+	// 4. Return address
+	_if->rsp -= PTR_SIZE;
+	memset(_if->rsp, 0, PTR_SIZE);
 }
 
 
@@ -204,6 +280,8 @@ process_wait (tid_t child_tid UNUSED) {
 	/* XXX: Hint) The pintos exit if process_wait (initd), we recommend you
 	 * XXX:       to add infinite loop here before
 	 * XXX:       implementing the process_wait. */
+
+	while(1){};		// project2 infinite loop 추가
 	return -1;
 }
 
@@ -329,6 +407,23 @@ load (const char *file_name, struct intr_frame *if_) {
 	bool success = false;
 	int i;
 
+	// project2 추가 부분
+	/* file_name 자체를 parsing하기보단, 안전하게 복사본을 새로 만들자 */
+	char* file_name_copy[48];
+	memcpy(file_name_copy, file_name, strlen(file_name)+1);		// strlen은 \0을 빼고 세 주므로(\n?).
+	
+	/* strtok_r() 사용 준비 */
+	char *token, *save_ptr;
+	char *argv[64];		// 인자들 넣을 준비
+
+	int argc = 0;
+	for (token = strtok_r(file_name_copy, " ", &save_ptr); token != NULL;
+		token = strtok_r(NULL, " ", &save_ptr)){
+			argv[argc] = token;
+			argc++;
+		}
+		// argv = {"args-single", "onearg", NULL}가 된다.
+
 	/* Allocate and activate page directory. */
 	t->pml4 = pml4_create ();
 	if (t->pml4 == NULL)
@@ -336,9 +431,9 @@ load (const char *file_name, struct intr_frame *if_) {
 	process_activate (thread_current ());
 
 	/* Open executable file. */
-	file = filesys_open (file_name);
+	file = filesys_open (argv[0]);		// project2 수정부분. file_name을 argv[0]으로.
 	if (file == NULL) {
-		printf ("load: %s: open failed\n", file_name);
+		printf ("load: %s: open failed\n", argv[0]);
 		goto done;
 	}
 
@@ -416,12 +511,12 @@ load (const char *file_name, struct intr_frame *if_) {
 
 	/* TODO: Your code goes here.
 	 * TODO: Implement argument passing (see project2/argument_passing.html). */
-
+	
 	success = true;
 
-done:
+	done:
 	/* We arrive here whether the load is successful or not. */
-	file_close (file);
+	// file_close (file);		// project2 수정 부분. 주석처리 함
 	return success;
 }
 
@@ -544,7 +639,8 @@ setup_stack (struct intr_frame *if_) {
 	if (kpage != NULL) {
 		success = install_page (((uint8_t *) USER_STACK) - PGSIZE, kpage, true);
 		if (success)
-			if_->rsp = USER_STACK;
+			// if_->rsp = USER_STACK;		// project2 주석처리
+			if_->rsp = USER_STACK;		// project2 추가 - argument parsing 최종 결과를 위해 수정한 부분(원래는 USER_STACK-12)
 		else
 			palloc_free_page (kpage);
 	}
